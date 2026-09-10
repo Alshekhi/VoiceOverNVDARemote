@@ -1068,6 +1068,59 @@ final class MacRemoteCoreTests: XCTestCase {
         XCTAssertTrue(controller.snapshot.eventLog.contains { $0.message.contains("Protocol decode failed") })
     }
 
+    // A session that ends while controlling must hand the keyboard back. Otherwise the
+    // event tap keeps swallowing every Mac key, and the toggle hotkey is ignored because
+    // it is only honoured in the controlling phase: no way back without killing the app.
+    @MainActor
+    func testTransportDropWhileControllingReleasesKeyboard() async throws {
+        let transport = MockTransport()
+        let keyCapture = MockKeyCapture()
+        let controller = RemoteSessionController(
+            transport: transport,
+            announcer: MockAnnouncer(),
+            clipboard: MockClipboard(),
+            keyCapture: keyCapture,
+            permissionChecker: MockPermissionChecker(isTrusted: true),
+            globalHotKeyManager: MockGlobalHotKeyManager(),
+            settingsStore: MockSettingsStore()
+        )
+
+        await controller.connect(using: sampleConfiguration(role: .master))
+        await settle()
+        controller.toggleControl()
+        transport.emit(.disconnected("Network is down"))
+        await settle()
+
+        XCTAssertEqual(controller.snapshot.phase, .failed("Network is down"))
+        XCTAssertFalse(controller.snapshot.keyCaptureActive)
+        XCTAssertEqual(keyCapture.stopCallCount, 1)
+    }
+
+    @MainActor
+    func testRelayReportedFailureWhileControllingReleasesKeyboard() async throws {
+        let transport = MockTransport()
+        let keyCapture = MockKeyCapture()
+        let controller = RemoteSessionController(
+            transport: transport,
+            announcer: MockAnnouncer(),
+            clipboard: MockClipboard(),
+            keyCapture: keyCapture,
+            permissionChecker: MockPermissionChecker(isTrusted: true),
+            globalHotKeyManager: MockGlobalHotKeyManager(),
+            settingsStore: MockSettingsStore()
+        )
+
+        await controller.connect(using: sampleConfiguration(role: .master))
+        await settle()
+        controller.toggleControl()
+        transport.emit(.message(.init(message: .nvdaNotConnected)))
+        await settle()
+
+        XCTAssertEqual(controller.snapshot.phase, .failed("Remote NVDA not connected"))
+        XCTAssertFalse(controller.snapshot.keyCaptureActive)
+        XCTAssertEqual(keyCapture.stopCallCount, 1)
+    }
+
     private func sampleConfiguration(role: RemoteRole) -> RemoteConnectionConfiguration {
         RemoteConnectionConfiguration(
             host: "localhost",

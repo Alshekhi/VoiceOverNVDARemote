@@ -1208,6 +1208,14 @@ public final class RemoteSessionController: ObservableObject {
         }
     }
 
+    /// Every path that ends the session hands the keyboard back first. Otherwise the event
+    /// tap keeps swallowing every Mac key while the toggle hotkey is ignored, because the
+    /// hotkey is only honoured in the controlling phase.
+    private func endSession(_ phase: RemoteSessionPhase) {
+        stopControllingLocally(reason: nil)
+        snapshot.phase = phase
+    }
+
     private func handle(event: TransportEvent) {
         switch event {
         case .connected:
@@ -1220,10 +1228,10 @@ public final class RemoteSessionController: ObservableObject {
             }
         case let .disconnected(reason):
             if let reason, !reason.isEmpty {
-                snapshot.phase = .failed(reason)
+                endSession(.failed(reason))
                 appendEvent("Transport disconnected: \(reason)")
             } else {
-                snapshot.phase = .idle
+                endSession(.idle)
                 appendEvent("Transport disconnected")
             }
         case let .decodeFailure(message):
@@ -1282,15 +1290,15 @@ public final class RemoteSessionController: ObservableObject {
         case let .motd(payload):
             appendEvent("MOTD: \(payload.motd)")
         case .versionMismatch:
-            snapshot.phase = .failed("Protocol version mismatch")
+            endSession(.failed("Protocol version mismatch"))
             appendEvent("Protocol version mismatch")
         case .nvdaNotConnected:
-            snapshot.phase = .failed("Remote NVDA not connected")
+            endSession(.failed("Remote NVDA not connected"))
             appendEvent("Remote NVDA not connected")
         case .ping:
             appendEvent("Heartbeat received")
         case let .error(payload):
-            snapshot.phase = .failed(payload.message)
+            endSession(.failed(payload.message))
             appendEvent("Remote error [\(payload.code)]: \(payload.message)")
         case let .unsupported(type):
             appendEvent("Ignored unsupported relay message: \(type)")
