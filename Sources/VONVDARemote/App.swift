@@ -1,3 +1,4 @@
+import AppKit
 import MacRemoteCore
 import RemoteProtocol
 import SwiftUI
@@ -5,7 +6,8 @@ import SwiftUI
 @main
 struct VONVDARemoteApp: App {
     @StateObject private var controller = RemoteSessionController(
-        transport: NVDAProtocolTransport()
+        transport: NVDAProtocolTransport(),
+        capsLockRemapper: HIDUtilCapsLockRemapper()
     )
     @StateObject private var sparkleController = SparkleController()
 
@@ -13,6 +15,10 @@ struct VONVDARemoteApp: App {
         WindowGroup("VO NVDA Remote") {
             ContentView(controller: controller)
                 .frame(minWidth: 900, minHeight: 620)
+                // Never leave Caps Lock remapped after a quit mid-control.
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+                    controller.prepareForTermination()
+                }
         }
         .commands {
             CommandGroup(after: .appInfo) {

@@ -1121,6 +1121,314 @@ final class MacRemoteCoreTests: XCTestCase {
         XCTAssertEqual(keyCapture.stopCallCount, 1)
     }
 
+    // MARK: Insert as an NVDA key
+
+    func testInsertTargetSendsExtendedInsert() {
+        let mapping = RemoteModifierMapping(rightCommand: .insert)
+        XCTAssertEqual(MacVirtualKeyMapper.windowsVirtualKey(for: 54, modifierMapping: mapping), 0x2D)
+        XCTAssertTrue(RemoteModifierTarget.insert.extended)
+        XCTAssertEqual(MacVirtualKeyMapper.windowsScanCode(for: 0x2D), 0x52)
+    }
+
+    @MainActor
+    func testInsertHeldAsNVDAKeyChordsWithPrimaryKey() async throws {
+        let transport = MockTransport()
+        let keyCapture = MockKeyCapture()
+        let controller = RemoteSessionController(
+            transport: transport,
+            announcer: MockAnnouncer(),
+            clipboard: MockClipboard(),
+            keyCapture: keyCapture,
+            permissionChecker: MockPermissionChecker(isTrusted: true),
+            globalHotKeyManager: MockGlobalHotKeyManager(),
+            settingsStore: MockSettingsStore()
+        )
+
+        await controller.connect(using: sampleConfiguration(role: .master))
+        await settle()
+        controller.toggleControl()
+        keyCapture.emit(.init(vkCode: 0x2D, scanCode: 0x52, extended: true, pressed: true))
+        keyCapture.emit(.init(vkCode: 0x4E, scanCode: 0x31, pressed: true))
+        keyCapture.emit(.init(vkCode: 0x4E, scanCode: 0x31, pressed: false))
+        keyCapture.emit(.init(vkCode: 0x2D, scanCode: 0x52, extended: true, pressed: false))
+        await settle()
+
+        assertTrailingKeySequence(
+            transport.sentMessages,
+            expected: [
+                .init(vkCode: 0x2D, scanCode: 0x52, extended: true, pressed: true),
+                .init(vkCode: 0x4E, scanCode: 0x31, extended: false, pressed: true),
+                .init(vkCode: 0x4E, scanCode: 0x31, extended: false, pressed: false),
+                .init(vkCode: 0x2D, scanCode: 0x52, extended: true, pressed: false),
+            ]
+        )
+    }
+
+    // MARK: Caps Lock remapped to F20 while controlling
+    //
+    // macOS reports Caps Lock only as a latch (on at one press, off at the next), never
+    // its release, so NVDA saw it held until the next press. While controlling, Caps
+    // Lock is remapped to F20, which reports real press and release.
+
+    func testRemappedCapsLockF20MapsToWindowsCapsLock() {
+        XCTAssertEqual(MacVirtualKeyMapper.windowsVirtualKey(for: 90), 0x14)
+    }
+
+    func testCapsLockHotKeyFlagsFollowHeldKeyOnceRemapped() {
+        var routing = KeyboardRoutingConfiguration()
+        let hotKey = routing.toggleHotKey
+        let keyCode = UInt16(hotKey.keyCode)
+        // Without the remap the latch semantics are unchanged.
+        XCTAssertFalse(hotKey.matches(keyCode: keyCode, modifiers: routing.hotKeyFlags([.maskAlphaShift], remappedCapsLockHeld: false)))
+        routing.capsLockRemapped = true
+        // A lit Caps Lock no longer blocks the way back to the Mac...
+        XCTAssertTrue(hotKey.matches(keyCode: keyCode, modifiers: routing.hotKeyFlags([.maskAlphaShift], remappedCapsLockHeld: false)))
+        XCTAssertTrue(hotKey.matches(keyCode: keyCode, modifiers: routing.hotKeyFlags(NSEvent.ModifierFlags.capsLock, remappedCapsLockHeld: false)))
+        // ...while Caps Lock held with F12 still reaches NVDA.
+        XCTAssertFalse(hotKey.matches(keyCode: keyCode, modifiers: routing.hotKeyFlags(CGEventFlags(), remappedCapsLockHeld: true)))
+        XCTAssertFalse(hotKey.matches(keyCode: keyCode, modifiers: routing.hotKeyFlags(NSEvent.ModifierFlags(), remappedCapsLockHeld: true)))
+    }
+
+    @MainActor
+    func testStartingControlRemapsCapsLockAndStoppingRestoresIt() async throws {
+        let remapper = MockCapsLockRemapper()
+        let keyCapture = MockKeyCapture()
+        let controller = RemoteSessionController(
+            transport: MockTransport(),
+            announcer: MockAnnouncer(),
+            clipboard: MockClipboard(),
+            keyCapture: keyCapture,
+            permissionChecker: MockPermissionChecker(isTrusted: true),
+            globalHotKeyManager: MockGlobalHotKeyManager(),
+            settingsStore: MockSettingsStore(),
+            capsLockRemapper: remapper
+        )
+
+        await controller.connect(using: sampleConfiguration(role: .master))
+        await settle()
+        controller.toggleControl()
+        // The first restore is at launch: it clears a remap left behind by a crash.
+        XCTAssertEqual(remapper.calls, ["restore", "apply"])
+        XCTAssertEqual(keyCapture.lastKeyboardRouting?.capsLockRemapped, true)
+        controller.toggleControl()
+        await settle()
+
+        XCTAssertEqual(remapper.calls, ["restore", "apply", "restore"])
+        XCTAssertEqual(keyCapture.lastKeyboardRouting?.capsLockRemapped, false)
+    }
+
+    @MainActor
+    func testSessionDropWhileControllingRestoresCapsLock() async throws {
+        let transport = MockTransport()
+        let remapper = MockCapsLockRemapper()
+        let controller = RemoteSessionController(
+            transport: transport,
+            announcer: MockAnnouncer(),
+            clipboard: MockClipboard(),
+            keyCapture: MockKeyCapture(),
+            permissionChecker: MockPermissionChecker(isTrusted: true),
+            globalHotKeyManager: MockGlobalHotKeyManager(),
+            settingsStore: MockSettingsStore(),
+            capsLockRemapper: remapper
+        )
+
+        await controller.connect(using: sampleConfiguration(role: .master))
+        await settle()
+        controller.toggleControl()
+        transport.emit(.disconnected("Network is down"))
+        await settle()
+
+        XCTAssertEqual(remapper.calls, ["restore", "apply", "restore"])
+    }
+
+    @MainActor
+    func testCapsLockRemapFailureKeepsControlAndIsLogged() async throws {
+        let remapper = MockCapsLockRemapper()
+        remapper.applyError = NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "hidutil failed"])
+        let keyCapture = MockKeyCapture()
+        let controller = RemoteSessionController(
+            transport: MockTransport(),
+            announcer: MockAnnouncer(),
+            clipboard: MockClipboard(),
+            keyCapture: keyCapture,
+            permissionChecker: MockPermissionChecker(isTrusted: true),
+            globalHotKeyManager: MockGlobalHotKeyManager(),
+            settingsStore: MockSettingsStore(),
+            capsLockRemapper: remapper
+        )
+
+        await controller.connect(using: sampleConfiguration(role: .master))
+        await settle()
+        controller.toggleControl()
+
+        XCTAssertEqual(controller.snapshot.phase, .controlling)
+        XCTAssertTrue(controller.snapshot.eventLog.contains { $0.message.contains("Caps Lock remap failed") })
+        XCTAssertNotEqual(keyCapture.lastKeyboardRouting?.capsLockRemapped, true)
+        controller.toggleControl()
+        await settle()
+        XCTAssertEqual(remapper.calls, ["restore", "apply"])
+    }
+
+    @MainActor
+    func testPrepareForTerminationRestoresCapsLock() async throws {
+        let remapper = MockCapsLockRemapper()
+        let controller = RemoteSessionController(
+            transport: MockTransport(),
+            announcer: MockAnnouncer(),
+            clipboard: MockClipboard(),
+            keyCapture: MockKeyCapture(),
+            permissionChecker: MockPermissionChecker(isTrusted: true),
+            globalHotKeyManager: MockGlobalHotKeyManager(),
+            settingsStore: MockSettingsStore(),
+            capsLockRemapper: remapper
+        )
+
+        await controller.connect(using: sampleConfiguration(role: .master))
+        await settle()
+        controller.toggleControl()
+        controller.prepareForTermination()
+
+        XCTAssertEqual(remapper.calls, ["restore", "apply", "restore"])
+        XCTAssertFalse(controller.snapshot.keyCaptureActive)
+    }
+
+    // MARK: hidutil remapper
+
+    func testHIDUtilRemapperParsesHIDUtilOutput() {
+        XCTAssertEqual(HIDUtilCapsLockRemapper.parse("(null)\n"), [])
+        XCTAssertEqual(HIDUtilCapsLockRemapper.parse("(\n)\n"), [])
+        let output = """
+        (
+                {
+                HIDKeyboardModifierMappingDst = 30064771183;
+                HIDKeyboardModifierMappingSrc = 30064771129;
+            }
+        )
+        """
+        XCTAssertEqual(HIDUtilCapsLockRemapper.parse(output), [.init(source: 0x7_0000_0039, destination: 0x7_0000_006F)])
+    }
+
+    func testHIDUtilRemapperKeepsOtherMappingsAndReturnsDisplacedCapsLock() throws {
+        // An existing Caps Lock -> Escape remap, and an unrelated one.
+        var getOutput = """
+        (
+                {
+                HIDKeyboardModifierMappingDst = 30064771113;
+                HIDKeyboardModifierMappingSrc = 30064771129;
+            },
+                {
+                HIDKeyboardModifierMappingDst = 30064771300;
+                HIDKeyboardModifierMappingSrc = 30064771301;
+            }
+        )
+        """
+        var sets: [String] = []
+        let remapper = HIDUtilCapsLockRemapper { arguments in
+            if arguments.contains("--set") { sets.append(arguments.last ?? "") }
+            return getOutput
+        }
+
+        try remapper.apply()
+        XCTAssertEqual(sets.last, #"{"UserKeyMapping":[{"HIDKeyboardModifierMappingSrc":30064771301,"HIDKeyboardModifierMappingDst":30064771300},{"HIDKeyboardModifierMappingSrc":30064771129,"HIDKeyboardModifierMappingDst":30064771183}]}"#)
+
+        getOutput = """
+        (
+                {
+                HIDKeyboardModifierMappingDst = 30064771300;
+                HIDKeyboardModifierMappingSrc = 30064771301;
+            },
+                {
+                HIDKeyboardModifierMappingDst = 30064771183;
+                HIDKeyboardModifierMappingSrc = 30064771129;
+            }
+        )
+        """
+        try remapper.restore()
+        XCTAssertEqual(sets.last, #"{"UserKeyMapping":[{"HIDKeyboardModifierMappingSrc":30064771301,"HIDKeyboardModifierMappingDst":30064771300},{"HIDKeyboardModifierMappingSrc":30064771129,"HIDKeyboardModifierMappingDst":30064771113}]}"#)
+    }
+
+    func testHIDUtilRemapperRestoreLeavesSystemAloneWithoutItsMapping() throws {
+        var sets: [String] = []
+        let remapper = HIDUtilCapsLockRemapper { arguments in
+            if arguments.contains("--set") { sets.append(arguments.last ?? "") }
+            return "(null)\n"
+        }
+
+        try remapper.restore()
+        XCTAssertEqual(sets, [])
+    }
+
+    private final class MockCapsLockRemapper: CapsLockRemapping {
+        private(set) var calls: [String] = []
+        var applyError: Error?
+
+        func apply() throws {
+            calls.append("apply")
+            if let applyError { throw applyError }
+        }
+
+        func restore() throws {
+            calls.append("restore")
+        }
+    }
+
+    // MARK: Numpad as NVDA's desktop layout expects
+    //
+    // NVDA's desktop layout binds the keypad as Windows sends it with Num Lock off:
+    // numpad 7 is Home without the extended flag, numpad 0 is Insert (an NVDA key),
+    // numpad Enter is Enter with the flag. Sending the Num Lock-on digits made every
+    // numpad command reach NVDA as a digit.
+
+    func testKeypadSendsNumLockOffKeysForNVDADesktopLayout() {
+        let expected: [(macKeyCode: CGKeyCode, vkCode: UInt16, extended: Bool)] = [
+            (82, 0x2D, false), (83, 0x23, false), (84, 0x28, false), (85, 0x22, false),
+            (86, 0x25, false), (87, 0x0C, false), (88, 0x27, false), (89, 0x24, false),
+            (91, 0x26, false), (92, 0x21, false), (65, 0x2E, false), (76, 0x0D, true),
+            (67, 0x6A, false), (69, 0x6B, false), (75, 0x6F, true), (78, 0x6D, false),
+        ]
+        for key in expected {
+            XCTAssertEqual(MacVirtualKeyMapper.windowsVirtualKey(for: key.macKeyCode), key.vkCode, "keypad key \(key.macKeyCode)")
+            XCTAssertEqual(MacVirtualKeyMapper.isExtended(vkCode: key.vkCode, macKeyCode: key.macKeyCode), key.extended, "keypad key \(key.macKeyCode)")
+        }
+        // The dedicated Home and Return keys keep their flags, so NVDA tells them apart.
+        XCTAssertTrue(MacVirtualKeyMapper.isExtended(vkCode: 0x24, macKeyCode: 115))
+        XCTAssertFalse(MacVirtualKeyMapper.isExtended(vkCode: 0x0D, macKeyCode: 36))
+    }
+
+    // MARK: Remembered server
+
+    @MainActor
+    func testConnectRemembersServerForTheNextLaunch() async throws {
+        let settingsStore = MockSettingsStore()
+        let controller = RemoteSessionController(
+            transport: MockTransport(),
+            announcer: MockAnnouncer(),
+            clipboard: MockClipboard(),
+            keyCapture: MockKeyCapture(),
+            permissionChecker: MockPermissionChecker(isTrusted: true),
+            globalHotKeyManager: MockGlobalHotKeyManager(),
+            settingsStore: settingsStore
+        )
+        XCTAssertNil(controller.rememberedHost)
+
+        await controller.connect(using: RemoteConnectionConfiguration(host: "relay.example", port: 7000, key: "session-secret"))
+
+        let relaunched = RemoteSessionController(
+            transport: MockTransport(),
+            announcer: MockAnnouncer(),
+            clipboard: MockClipboard(),
+            keyCapture: MockKeyCapture(),
+            permissionChecker: MockPermissionChecker(isTrusted: true),
+            globalHotKeyManager: MockGlobalHotKeyManager(),
+            settingsStore: settingsStore
+        )
+        XCTAssertEqual(relaunched.rememberedHost, "relay.example")
+        XCTAssertEqual(relaunched.rememberedPort, 7000)
+        // Settings are plain UserDefaults: the session key must never land there.
+        let saved = String(decoding: try JSONEncoder().encode(settingsStore.current), as: UTF8.self)
+        XCTAssertFalse(saved.contains("session-secret"))
+    }
+
     private func sampleConfiguration(role: RemoteRole) -> RemoteConnectionConfiguration {
         RemoteConnectionConfiguration(
             host: "localhost",
@@ -1284,20 +1592,23 @@ private let capsLockKey = DocumentedGestureKey(0x14, extended: false)
 private let shiftKey = DocumentedGestureKey(0xA0, extended: false)
 private let controlKey = DocumentedGestureKey(0xA2, extended: false)
 private let altKey = DocumentedGestureKey(0xA4, extended: false)
-private let numpad1Key = DocumentedGestureKey(0x61, extended: false)
-private let numpad2Key = DocumentedGestureKey(0x62, extended: false)
-private let numpad3Key = DocumentedGestureKey(0x63, extended: false)
-private let numpad4Key = DocumentedGestureKey(0x64, extended: false)
-private let numpad5Key = DocumentedGestureKey(0x65, extended: false)
-private let numpad6Key = DocumentedGestureKey(0x66, extended: false)
-private let numpad7Key = DocumentedGestureKey(0x67, extended: false)
-private let numpad8Key = DocumentedGestureKey(0x68, extended: false)
-private let numpad9Key = DocumentedGestureKey(0x69, extended: false)
+// NVDA's desktop layout names the keypad as Windows sends it with Num Lock off
+// (nvda source/vkCodes.py): numpad1 is End without the extended flag, and so on.
+// 0x61-0x69 are NVDA's "numLockNumpad" digits, which no numpad command uses.
+private let numpad1Key = DocumentedGestureKey(0x23, extended: false)
+private let numpad2Key = DocumentedGestureKey(0x28, extended: false)
+private let numpad3Key = DocumentedGestureKey(0x22, extended: false)
+private let numpad4Key = DocumentedGestureKey(0x25, extended: false)
+private let numpad5Key = DocumentedGestureKey(0x0C, extended: false)
+private let numpad6Key = DocumentedGestureKey(0x27, extended: false)
+private let numpad7Key = DocumentedGestureKey(0x24, extended: false)
+private let numpad8Key = DocumentedGestureKey(0x26, extended: false)
+private let numpad9Key = DocumentedGestureKey(0x21, extended: false)
 private let numpadMinusKey = DocumentedGestureKey(0x6D, extended: false)
 private let numpadPlusKey = DocumentedGestureKey(0x6B, extended: false)
 private let numpadDivideKey = DocumentedGestureKey(0x6F, extended: true)
 private let numpadMultiplyKey = DocumentedGestureKey(0x6A, extended: false)
-private let numpadDeleteKey = DocumentedGestureKey(0x6E, extended: false)
+private let numpadDeleteKey = DocumentedGestureKey(0x2E, extended: false)
 private let numpadEnterKey = DocumentedGestureKey(0x0D, extended: true)
 
 private let nvdaLaptopGestureCorpus: [DocumentedNVDAGesture] = [

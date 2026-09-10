@@ -135,6 +135,7 @@ public enum RemoteModifierTarget: String, CaseIterable, Codable, Equatable, Send
     case leftWindows
     case rightWindows
     case application
+    case insert
 
     public var displayName: String {
         switch self {
@@ -156,6 +157,8 @@ public enum RemoteModifierTarget: String, CaseIterable, Codable, Equatable, Send
             "Right Windows"
         case .application:
             "Application"
+        case .insert:
+            "Insert (NVDA key)"
         }
     }
 
@@ -179,6 +182,8 @@ public enum RemoteModifierTarget: String, CaseIterable, Codable, Equatable, Send
             0x5C
         case .application:
             0x5D
+        case .insert:
+            0x2D
         }
     }
 
@@ -289,13 +294,35 @@ extension RemoteModifierMapping: Codable {
 public struct KeyboardRoutingConfiguration: Equatable, Sendable {
     public var toggleHotKey: ToggleHotKey
     public var modifierMapping: RemoteModifierMapping
+    /// Caps Lock arrives as F20 (see CapsLockRemapping) while remote control is active.
+    public var capsLockRemapped: Bool
 
     public init(
         toggleHotKey: ToggleHotKey = GlobalToggleHotKeyOption.controlShiftCommandR.hotKey,
-        modifierMapping: RemoteModifierMapping = .default
+        modifierMapping: RemoteModifierMapping = .default,
+        capsLockRemapped: Bool = false
     ) {
         self.toggleHotKey = toggleHotKey
         self.modifierMapping = modifierMapping
+        self.capsLockRemapped = capsLockRemapped
+    }
+
+    /// The flags the toggle hotkey is matched against, where Caps Lock means "held".
+    /// With Caps Lock remapped the system latch flag is stale - control swallows the
+    /// key, so it never changes - and only the held F20 counts. Otherwise a lit Caps
+    /// Lock would block the hotkey, the only way back to the Mac.
+    func hotKeyFlags(_ flags: CGEventFlags, remappedCapsLockHeld: Bool) -> CGEventFlags {
+        guard capsLockRemapped else { return flags }
+        var result = flags.subtracting(.maskAlphaShift)
+        if remappedCapsLockHeld { result.insert(.maskAlphaShift) }
+        return result
+    }
+
+    func hotKeyFlags(_ flags: NSEvent.ModifierFlags, remappedCapsLockHeld: Bool) -> NSEvent.ModifierFlags {
+        guard capsLockRemapped else { return flags }
+        var result = flags.subtracting(.capsLock)
+        if remappedCapsLockHeld { result.insert(.capsLock) }
+        return result
     }
 }
 
@@ -318,17 +345,25 @@ public struct RemoteAppSettings: Equatable, Sendable {
     public var globalToggleHotKey: GlobalToggleHotKeyOption
     public var modifierMapping: RemoteModifierMapping
     public var speechOutputMode: SpeechOutputMode
+    /// The last server connected to, offered again at launch. The session key is not
+    /// kept: these settings are plain UserDefaults.
+    public var lastHost: String?
+    public var lastPort: UInt16?
 
     public init(
         keyCaptureScope: KeyCaptureScope = .session,
         globalToggleHotKey: GlobalToggleHotKeyOption = .controlShiftCommandR,
         modifierMapping: RemoteModifierMapping = .default,
-        speechOutputMode: SpeechOutputMode = .voiceOver
+        speechOutputMode: SpeechOutputMode = .voiceOver,
+        lastHost: String? = nil,
+        lastPort: UInt16? = nil
     ) {
         self.keyCaptureScope = keyCaptureScope
         self.globalToggleHotKey = globalToggleHotKey
         self.modifierMapping = modifierMapping
         self.speechOutputMode = speechOutputMode
+        self.lastHost = lastHost
+        self.lastPort = lastPort
     }
 }
 
@@ -338,6 +373,8 @@ extension RemoteAppSettings: Codable {
         case globalToggleHotKey
         case modifierMapping
         case speechOutputMode
+        case lastHost
+        case lastPort
     }
 
     public init(from decoder: Decoder) throws {
@@ -346,7 +383,9 @@ extension RemoteAppSettings: Codable {
             keyCaptureScope: try container.decodeIfPresent(KeyCaptureScope.self, forKey: .keyCaptureScope) ?? .session,
             globalToggleHotKey: try container.decodeIfPresent(GlobalToggleHotKeyOption.self, forKey: .globalToggleHotKey) ?? .controlShiftCommandR,
             modifierMapping: try container.decodeIfPresent(RemoteModifierMapping.self, forKey: .modifierMapping) ?? .default,
-            speechOutputMode: try container.decodeIfPresent(SpeechOutputMode.self, forKey: .speechOutputMode) ?? .voiceOver
+            speechOutputMode: try container.decodeIfPresent(SpeechOutputMode.self, forKey: .speechOutputMode) ?? .voiceOver,
+            lastHost: try container.decodeIfPresent(String.self, forKey: .lastHost),
+            lastPort: try container.decodeIfPresent(UInt16.self, forKey: .lastPort)
         )
     }
 
@@ -356,6 +395,8 @@ extension RemoteAppSettings: Codable {
         try container.encode(globalToggleHotKey, forKey: .globalToggleHotKey)
         try container.encode(modifierMapping, forKey: .modifierMapping)
         try container.encode(speechOutputMode, forKey: .speechOutputMode)
+        try container.encodeIfPresent(lastHost, forKey: .lastHost)
+        try container.encodeIfPresent(lastPort, forKey: .lastPort)
     }
 }
 
@@ -546,6 +587,9 @@ public final class EventTapKeyCapture: KeyCaptureManaging {
     private var modifierState: [CGKeyCode: Bool] = [:]
     private var localModifierState: [UInt16: Bool] = [:]
     private var keyboardRouting = KeyboardRoutingConfiguration()
+    /// F20 is Caps Lock while remapped; tracked so the hotkey sees Caps Lock as held.
+    private var remappedCapsLockHeld = false
+    private static let remappedCapsLockKeyCode = Int64(kVK_F20)
 
     public init() {}
 
@@ -617,6 +661,7 @@ public final class EventTapKeyCapture: KeyCaptureManaging {
         self.localMonitor = nil
         modifierState.removeAll(keepingCapacity: false)
         localModifierState.removeAll(keepingCapacity: false)
+        remappedCapsLockHeld = false
     }
 
     public func updateKeyboardRouting(_ configuration: KeyboardRoutingConfiguration) {
@@ -639,42 +684,50 @@ public final class EventTapKeyCapture: KeyCaptureManaging {
 
     private func makeCapturedEvent(from event: CGEvent, type: CGEventType) -> CapturedKeyEvent? {
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-        let isToggleHotKey = keyboardRouting.toggleHotKey.matches(keyCode: UInt16(keyCode), modifiers: event.flags)
+        if keyCode == Self.remappedCapsLockKeyCode, type == .keyDown || type == .keyUp {
+            remappedCapsLockHeld = type == .keyDown
+        }
+        let hotKeyFlags = keyboardRouting.hotKeyFlags(event.flags, remappedCapsLockHeld: remappedCapsLockHeld)
+        let isToggleHotKey = keyboardRouting.toggleHotKey.matches(keyCode: UInt16(keyCode), modifiers: hotKeyFlags)
         guard let mappedKey = MacVirtualKeyMapper.windowsVirtualKey(for: CGKeyCode(keyCode), modifierMapping: keyboardRouting.modifierMapping) else {
             return nil
         }
         switch type {
         case .keyDown:
-            return .init(vkCode: mappedKey, scanCode: MacVirtualKeyMapper.windowsScanCode(for: mappedKey), extended: MacVirtualKeyMapper.isExtended(vkCode: mappedKey), pressed: true, isToggleHotKey: isToggleHotKey)
+            return .init(vkCode: mappedKey, scanCode: MacVirtualKeyMapper.windowsScanCode(for: mappedKey), extended: MacVirtualKeyMapper.isExtended(vkCode: mappedKey, macKeyCode: CGKeyCode(keyCode)), pressed: true, isToggleHotKey: isToggleHotKey)
         case .keyUp:
-            return .init(vkCode: mappedKey, scanCode: MacVirtualKeyMapper.windowsScanCode(for: mappedKey), extended: MacVirtualKeyMapper.isExtended(vkCode: mappedKey), pressed: false, isToggleHotKey: isToggleHotKey)
+            return .init(vkCode: mappedKey, scanCode: MacVirtualKeyMapper.windowsScanCode(for: mappedKey), extended: MacVirtualKeyMapper.isExtended(vkCode: mappedKey, macKeyCode: CGKeyCode(keyCode)), pressed: false, isToggleHotKey: isToggleHotKey)
         case .flagsChanged:
             let isPressed = event.flags.contains(MacVirtualKeyMapper.modifierFlag(for: CGKeyCode(keyCode)))
             let previous = modifierState[CGKeyCode(keyCode)] ?? false
             modifierState[CGKeyCode(keyCode)] = isPressed
             guard previous != isPressed else { return nil }
-            return .init(vkCode: mappedKey, scanCode: MacVirtualKeyMapper.windowsScanCode(for: mappedKey), extended: MacVirtualKeyMapper.isExtended(vkCode: mappedKey), pressed: isPressed, isToggleHotKey: isToggleHotKey)
+            return .init(vkCode: mappedKey, scanCode: MacVirtualKeyMapper.windowsScanCode(for: mappedKey), extended: MacVirtualKeyMapper.isExtended(vkCode: mappedKey, macKeyCode: CGKeyCode(keyCode)), pressed: isPressed, isToggleHotKey: isToggleHotKey)
         default:
             return nil
         }
     }
 
     private func makeCapturedEvent(from event: NSEvent) -> CapturedKeyEvent? {
-        let isToggleHotKey = keyboardRouting.toggleHotKey.matches(keyCode: event.keyCode, modifiers: event.modifierFlags)
+        if Int64(event.keyCode) == Self.remappedCapsLockKeyCode, event.type == .keyDown || event.type == .keyUp {
+            remappedCapsLockHeld = event.type == .keyDown
+        }
+        let hotKeyFlags = keyboardRouting.hotKeyFlags(event.modifierFlags, remappedCapsLockHeld: remappedCapsLockHeld)
+        let isToggleHotKey = keyboardRouting.toggleHotKey.matches(keyCode: event.keyCode, modifiers: hotKeyFlags)
         guard let mappedKey = MacVirtualKeyMapper.windowsVirtualKey(for: CGKeyCode(event.keyCode), modifierMapping: keyboardRouting.modifierMapping) else {
             return nil
         }
         switch event.type {
         case .keyDown:
-            return .init(vkCode: mappedKey, scanCode: MacVirtualKeyMapper.windowsScanCode(for: mappedKey), extended: MacVirtualKeyMapper.isExtended(vkCode: mappedKey), pressed: true, isToggleHotKey: isToggleHotKey)
+            return .init(vkCode: mappedKey, scanCode: MacVirtualKeyMapper.windowsScanCode(for: mappedKey), extended: MacVirtualKeyMapper.isExtended(vkCode: mappedKey, macKeyCode: CGKeyCode(event.keyCode)), pressed: true, isToggleHotKey: isToggleHotKey)
         case .keyUp:
-            return .init(vkCode: mappedKey, scanCode: MacVirtualKeyMapper.windowsScanCode(for: mappedKey), extended: MacVirtualKeyMapper.isExtended(vkCode: mappedKey), pressed: false, isToggleHotKey: isToggleHotKey)
+            return .init(vkCode: mappedKey, scanCode: MacVirtualKeyMapper.windowsScanCode(for: mappedKey), extended: MacVirtualKeyMapper.isExtended(vkCode: mappedKey, macKeyCode: CGKeyCode(event.keyCode)), pressed: false, isToggleHotKey: isToggleHotKey)
         case .flagsChanged:
             let isPressed = event.modifierFlags.contains(MacVirtualKeyMapper.localModifierFlag(for: event.keyCode))
             let previous = localModifierState[event.keyCode] ?? false
             localModifierState[event.keyCode] = isPressed
             guard previous != isPressed else { return nil }
-            return .init(vkCode: mappedKey, scanCode: MacVirtualKeyMapper.windowsScanCode(for: mappedKey), extended: MacVirtualKeyMapper.isExtended(vkCode: mappedKey), pressed: isPressed, isToggleHotKey: isToggleHotKey)
+            return .init(vkCode: mappedKey, scanCode: MacVirtualKeyMapper.windowsScanCode(for: mappedKey), extended: MacVirtualKeyMapper.isExtended(vkCode: mappedKey, macKeyCode: CGKeyCode(event.keyCode)), pressed: isPressed, isToggleHotKey: isToggleHotKey)
         default:
             return nil
         }
@@ -772,6 +825,10 @@ public final class UserDefaultsRemoteSettingsStore: RemoteSettingsStoring, @unch
 }
 
 enum MacVirtualKeyMapper {
+    // The keypad (65, 76, 82-92) sends what a Windows keypad sends with Num Lock off,
+    // which is what NVDA's desktop layout binds: numpad 7 is Home, numpad 0 is Insert
+    // (an NVDA key), the decimal key is Delete. isExtended(vkCode:macKeyCode:) keeps
+    // them apart from the dedicated navigation keys.
     private static let nonModifierMapping: [CGKeyCode: UInt16] = [
         0: 0x41, 1: 0x53, 2: 0x44, 3: 0x46, 4: 0x48, 5: 0x47,
         6: 0x5A, 7: 0x58, 8: 0x43, 9: 0x56, 11: 0x42, 12: 0x51,
@@ -781,10 +838,10 @@ enum MacVirtualKeyMapper {
         31: 0x4F, 32: 0x55, 33: 0xDB, 34: 0x49, 35: 0x50, 36: 0x0D, 37: 0x4C,
         38: 0x4A, 39: 0xDE, 40: 0x4B, 41: 0xBA, 42: 0xDC, 43: 0xBC,
         44: 0xBF, 45: 0x4E, 46: 0x4D, 47: 0xBE, 48: 0x09, 49: 0x20, 50: 0xC0,
-        51: 0x08, 53: 0x1B, 57: 0x14, 65: 0x6E,
+        51: 0x08, 53: 0x1B, 57: 0x14, 65: 0x2E,
         67: 0x6A, 69: 0x6B, 71: 0x90, 75: 0x6F, 76: 0x0D, 78: 0x6D,
-        79: 0x7C, 80: 0x7D, 81: 0x6C, 82: 0x60, 83: 0x61, 84: 0x62, 85: 0x63, 86: 0x64,
-        87: 0x65, 88: 0x66, 89: 0x67, 91: 0x68, 92: 0x69, 96: 0x74,
+        79: 0x7C, 80: 0x7D, 81: 0x6C, 82: 0x2D, 83: 0x23, 84: 0x28, 85: 0x22, 86: 0x25,
+        87: 0x0C, 88: 0x27, 89: 0x24, 90: 0x14, 91: 0x26, 92: 0x21, 96: 0x74, // 90: F20, Caps Lock while remapped
         97: 0x75, 98: 0x76, 99: 0x72, 100: 0x77, 101: 0x78, 103: 0x7A,
         109: 0x79, 111: 0x7B, 115: 0x24, 116: 0x21, 117: 0x2E, 118: 0x73, 119: 0x23,
         120: 0x71, 121: 0x22, 122: 0x70, 123: 0x25, 124: 0x27, 125: 0x28,
@@ -794,7 +851,7 @@ enum MacVirtualKeyMapper {
     private static let windowsScanCodes: [UInt16: UInt16] = [
         0x08: 0x0E, 0x09: 0x0F, 0x0D: 0x1C, 0x14: 0x3A, 0x1B: 0x01, 0x20: 0x39,
         0x21: 0x49, 0x22: 0x51, 0x23: 0x4F, 0x24: 0x47, 0x25: 0x4B, 0x26: 0x48,
-        0x27: 0x4D, 0x28: 0x50, 0x2E: 0x53, 0x30: 0x0B, 0x31: 0x02, 0x32: 0x03,
+        0x27: 0x4D, 0x28: 0x50, 0x2D: 0x52, 0x2E: 0x53, 0x30: 0x0B, 0x31: 0x02, 0x32: 0x03,
         0x33: 0x04, 0x34: 0x05, 0x35: 0x06, 0x36: 0x07, 0x37: 0x08, 0x38: 0x09,
         0x39: 0x0A, 0x41: 0x1E, 0x42: 0x30, 0x43: 0x2E, 0x44: 0x20, 0x45: 0x12,
         0x46: 0x21, 0x47: 0x22, 0x48: 0x23, 0x49: 0x17, 0x4A: 0x24, 0x4B: 0x25,
@@ -856,6 +913,22 @@ enum MacVirtualKeyMapper {
         }
     }
 
+    /// Keypad keys that send navigation keys. Windows tells them from the dedicated
+    /// navigation keys only by the extended flag, which the keypad keys lack; keypad
+    /// Enter is the reverse, extended where Return is not.
+    private static let keypadNavigationKeyCodes: Set<CGKeyCode> = [65, 82, 83, 84, 85, 86, 87, 88, 89, 91, 92]
+    private static let keypadEnterKeyCode: CGKeyCode = 76
+
+    static func isExtended(vkCode: UInt16, macKeyCode: CGKeyCode) -> Bool {
+        if keypadNavigationKeyCodes.contains(macKeyCode) {
+            return false
+        }
+        if macKeyCode == keypadEnterKeyCode {
+            return true
+        }
+        return isExtended(vkCode: vkCode)
+    }
+
     static func isExtended(vkCode: UInt16) -> Bool {
         switch vkCode {
         case 0x5C, 0x5D, 0xA3, 0xA5, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x6F:
@@ -863,6 +936,118 @@ enum MacVirtualKeyMapper {
         default:
             return false
         }
+    }
+}
+
+/// Caps Lock for the duration of remote control. macOS reports Caps Lock only as a
+/// latch (on at one press, off at the next) and never its release, so NVDA saw it
+/// held until the next press. Remapped to F20, which no Apple keyboard has, it
+/// reports real press and release and is sent to Windows as Caps Lock.
+public protocol CapsLockRemapping: AnyObject {
+    func apply() throws
+    /// Undoes apply(). Also run at launch, to clear a remap left behind by a crash.
+    func restore() throws
+}
+
+/// The default: no system change. Only the app opts in to the hidutil remap, so tests
+/// and any other host never touch the Mac's keyboard.
+public final class NoCapsLockRemapping: CapsLockRemapping {
+    public init() {}
+    public func apply() throws {}
+    public func restore() throws {}
+}
+
+public final class HIDUtilCapsLockRemapper: CapsLockRemapping {
+    struct Mapping: Equatable {
+        let source: UInt64
+        let destination: UInt64
+    }
+
+    static let capsLockUsage: UInt64 = 0x7_0000_0039
+    static let f20Usage: UInt64 = 0x7_0000_006F
+    private static let remap = Mapping(source: capsLockUsage, destination: f20Usage)
+
+    private let run: ([String]) throws -> String
+    /// A Caps Lock remap the user already had; restore() puts it back.
+    private var displacedMapping: Mapping?
+
+    public convenience init() {
+        self.init(run: HIDUtilCapsLockRemapper.runHIDUtil)
+    }
+
+    init(run: @escaping ([String]) throws -> String) {
+        self.run = run
+    }
+
+    public func apply() throws {
+        var mappings = try currentMappings()
+        if let index = mappings.firstIndex(where: { $0.source == Self.capsLockUsage }) {
+            let existing = mappings.remove(at: index)
+            if existing != Self.remap {
+                displacedMapping = existing
+            }
+        }
+        mappings.append(Self.remap)
+        try set(mappings)
+    }
+
+    public func restore() throws {
+        var mappings = try currentMappings()
+        guard mappings.contains(Self.remap) else { return }
+        mappings.removeAll { $0 == Self.remap }
+        if let displacedMapping {
+            mappings.append(displacedMapping)
+            self.displacedMapping = nil
+        }
+        try set(mappings)
+    }
+
+    /// Parses `hidutil property --get UserKeyMapping`: "(null)", an empty "( )", or a
+    /// list of `{ HIDKeyboardModifierMappingDst = N; HIDKeyboardModifierMappingSrc = N; }`.
+    static func parse(_ output: String) -> [Mapping] {
+        output.components(separatedBy: "}").compactMap { block in
+            guard let source = value(of: "HIDKeyboardModifierMappingSrc", in: block),
+                  let destination = value(of: "HIDKeyboardModifierMappingDst", in: block) else {
+                return nil
+            }
+            return Mapping(source: source, destination: destination)
+        }
+    }
+
+    private static func value(of key: String, in block: String) -> UInt64? {
+        guard let range = block.range(of: "\(key) = ") else { return nil }
+        return UInt64(block[range.upperBound...].prefix { $0.isNumber })
+    }
+
+    private func currentMappings() throws -> [Mapping] {
+        Self.parse(try run(["property", "--get", "UserKeyMapping"]))
+    }
+
+    private func set(_ mappings: [Mapping]) throws {
+        let entries = mappings.map {
+            "{\"HIDKeyboardModifierMappingSrc\":\($0.source),\"HIDKeyboardModifierMappingDst\":\($0.destination)}"
+        }
+        _ = try run(["property", "--set", "{\"UserKeyMapping\":[\(entries.joined(separator: ","))]}"])
+    }
+
+    private static func runHIDUtil(_ arguments: [String]) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/hidutil")
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw NSError(
+                domain: "HIDUtilCapsLockRemapper",
+                code: Int(process.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: "hidutil failed: \(output)"]
+            )
+        }
+        return output
     }
 }
 
@@ -975,6 +1160,8 @@ public final class RemoteSessionController: ObservableObject {
     private let permissionChecker: AccessibilityPermissionChecking
     private let globalHotKeyManager: GlobalHotKeyManaging
     private let settingsStore: RemoteSettingsStoring
+    private let capsLockRemapper: CapsLockRemapping
+    private var capsLockRemapActive = false
     private var settings: RemoteAppSettings
     private var activeRemoteKeys: Set<ActiveRemoteKey> = []
     private var bufferedChordEvents: [ActiveRemoteKey: CapturedKeyEvent] = [:]
@@ -992,7 +1179,8 @@ public final class RemoteSessionController: ObservableObject {
         keyCapture: KeyCaptureManaging = EventTapKeyCapture(),
         permissionChecker: AccessibilityPermissionChecking = AccessibilityPermissionManager(),
         globalHotKeyManager: GlobalHotKeyManaging = CarbonGlobalHotKeyManager(),
-        settingsStore: RemoteSettingsStoring = UserDefaultsRemoteSettingsStore()
+        settingsStore: RemoteSettingsStoring = UserDefaultsRemoteSettingsStore(),
+        capsLockRemapper: CapsLockRemapping = NoCapsLockRemapping()
     ) {
         self.transport = transport
         self.announcer = announcer
@@ -1002,9 +1190,16 @@ public final class RemoteSessionController: ObservableObject {
         self.permissionChecker = permissionChecker
         self.globalHotKeyManager = globalHotKeyManager
         self.settingsStore = settingsStore
+        self.capsLockRemapper = capsLockRemapper
         self.settings = settingsStore.load()
         self.snapshot.accessibilityTrusted = permissionChecker.isTrusted(prompt: false)
         self.snapshot.keyCaptureScope = self.settings.keyCaptureScope
+        // A crash while controlling would leave Caps Lock remapped; clear it at launch.
+        do {
+            try capsLockRemapper.restore()
+        } catch {
+            appendEvent("Caps Lock restore failed: \(error.localizedDescription)")
+        }
         self.snapshot.globalToggleHotKey = self.settings.globalToggleHotKey
         self.snapshot.globalHotKeyDisplay = self.settings.globalToggleHotKey.displayName
         self.snapshot.modifierMapping = self.settings.modifierMapping
@@ -1051,7 +1246,7 @@ public final class RemoteSessionController: ObservableObject {
         snapshot.globalToggleHotKey = option
         snapshot.globalHotKeyDisplay = option.displayName
         keyCapture.updateKeyboardRouting(
-            .init(toggleHotKey: option.hotKey, modifierMapping: settings.modifierMapping)
+            .init(toggleHotKey: option.hotKey, modifierMapping: settings.modifierMapping, capsLockRemapped: capsLockRemapActive)
         )
         globalHotKeyManager.register(hotKey: option.hotKey)
         appendEvent("Global hotkey set to \(option.displayName)")
@@ -1062,7 +1257,7 @@ public final class RemoteSessionController: ObservableObject {
         settingsStore.save(settings)
         snapshot.modifierMapping = mapping
         keyCapture.updateKeyboardRouting(
-            .init(toggleHotKey: settings.globalToggleHotKey.hotKey, modifierMapping: mapping)
+            .init(toggleHotKey: settings.globalToggleHotKey.hotKey, modifierMapping: mapping, capsLockRemapped: capsLockRemapActive)
         )
         appendEvent("Custom keymap updated")
     }
@@ -1081,8 +1276,15 @@ public final class RemoteSessionController: ObservableObject {
         await connect(using: .init(host: host, port: port, key: key))
     }
 
+    /// The server from the last connection, for the connection form at launch.
+    public var rememberedHost: String? { settings.lastHost }
+    public var rememberedPort: UInt16? { settings.lastPort }
+
     public func connect(using configuration: RemoteConnectionConfiguration) async {
         activeConfiguration = configuration
+        settings.lastHost = configuration.host
+        settings.lastPort = configuration.port
+        settingsStore.save(settings)
         snapshot.phase = .connecting
         appendEvent("Connecting to \(configuration.host):\(configuration.port)")
         do {
@@ -1128,6 +1330,7 @@ public final class RemoteSessionController: ObservableObject {
                 appendEvent("Unable to start key capture")
                 return
             }
+            applyCapsLockRemap()
             announceControlState("Controlling remote machine")
             appendEvent("Controlling remote machine")
         case .controlling:
@@ -1358,8 +1561,43 @@ public final class RemoteSessionController: ObservableObject {
         }
     }
 
+    /// Ends remote control before the app quits, so Caps Lock is never left remapped.
+    public func prepareForTermination() {
+        stopControllingLocally(reason: nil)
+    }
+
+    private func applyCapsLockRemap() {
+        do {
+            try capsLockRemapper.apply()
+            capsLockRemapActive = true
+        } catch {
+            appendEvent("Caps Lock remap failed, so Caps Lock stays latched: \(error.localizedDescription)")
+        }
+        keyCapture.updateKeyboardRouting(currentKeyboardRouting())
+    }
+
+    private func restoreCapsLockRemap() {
+        guard capsLockRemapActive else { return }
+        capsLockRemapActive = false
+        do {
+            try capsLockRemapper.restore()
+        } catch {
+            appendEvent("Caps Lock restore failed: \(error.localizedDescription)")
+        }
+        keyCapture.updateKeyboardRouting(currentKeyboardRouting())
+    }
+
+    private func currentKeyboardRouting() -> KeyboardRoutingConfiguration {
+        .init(
+            toggleHotKey: settings.globalToggleHotKey.hotKey,
+            modifierMapping: settings.modifierMapping,
+            capsLockRemapped: capsLockRemapActive
+        )
+    }
+
     private func stopControllingLocally(reason: String?) {
         keyCapture.stop()
+        restoreCapsLockRemap()
         snapshot.keyCaptureActive = false
         if case .controlling = snapshot.phase {
             snapshot.phase = .connected
@@ -1480,7 +1718,7 @@ public final class RemoteSessionController: ObservableObject {
 
     private func isChordModifier(_ vkCode: UInt16) -> Bool {
         switch vkCode {
-        case 0x14, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C:
+        case 0x14, 0x2D, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C:
             return true
         default:
             return false

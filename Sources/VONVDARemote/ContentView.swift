@@ -8,7 +8,9 @@ struct ContentView: View {
 
     @State private var host = "nvdaremote.com"
     @State private var port = "6837"
-    @State private var key = "0871234321"
+    // Empty on purpose: a pre-filled key is nvdaremote.com's public demo channel, and on
+    // a private relay it silently joins a channel the remote machine is not in.
+    @State private var key = ""
     @State private var captureScope: KeyCaptureScope = .session
     @State private var globalHotKey: GlobalToggleHotKeyOption = .controlShiftCommandR
     @State private var speechOutputMode: SpeechOutputMode = .voiceOver
@@ -50,6 +52,12 @@ struct ContentView: View {
             captureScope = controller.snapshot.keyCaptureScope
             globalHotKey = controller.snapshot.globalToggleHotKey
             speechOutputMode = controller.snapshot.speechOutputMode
+            if let rememberedHost = controller.rememberedHost {
+                host = rememberedHost
+            }
+            if let rememberedPort = controller.rememberedPort {
+                port = String(rememberedPort)
+            }
         }
         .onChange(of: controller.snapshot.phase) { oldValue, newValue in
             soundPlayer.playTransition(from: oldValue, to: newValue)
